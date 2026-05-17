@@ -1,0 +1,195 @@
+# LG webOS TV blocklist template
+# ================================
+# Tested against LG 43UQ80006LB running webOS p20.04.54.40, mid-2026.
+# Tier 1: telemetry + ads (always safe to block)
+# Tier 2: tracking-heavy services (may break minor features)
+# Tier 3: aggressive (breaks LG account, OTA updates, LG Channels)
+#
+# Apply via your DNS backend's per-device group system. Pi-hole 6: groups + clients.
+# Each domain has comments: what it does, what breaks if you block it.
+
+name: lg-tv
+description: "LG webOS smart TVs (LG, LG Display TVs)"
+default_tier: 2
+
+domains:
+
+  # ============================================================
+  # TIER 1 — Telemetry, ads, viewing analytics (always safe)
+  # ============================================================
+
+  - domain: ad.lgappstv.com
+    tier: 1
+    category: ads
+    why_block: "Ad server for the LG Content Store"
+    breaks_if_blocked: "Removes banner ads in the LG Content Store"
+
+  - domain: ibs.lgappstv.com
+    tier: 1
+    category: telemetry
+    why_block: "Inertial behavior/engagement tracking. Sends usage stats."
+    breaks_if_blocked: "Nothing user-visible"
+
+  - domain: nudge.lgtvcommon.com
+    tier: 1
+    category: ads
+    why_block: |
+      'Nudge' system — pushes promo banners on the home screen (free trial offers,
+      app suggestions, LG Channels promotion). Polls every 30s.
+    breaks_if_blocked: "Home screen has fewer ads. No functional impact."
+
+  - domain: smartshare.lgtvsdp.com
+    tier: 1
+    category: telemetry
+    why_block: "SmartShare DLNA analytics"
+    breaks_if_blocked: "DLNA still works (local protocol). Just no usage reporting."
+
+  - domain: lgsmartad.com
+    tier: 1
+    category: ads
+    why_block: "LG smart ads platform — serves video/banner ads in apps"
+    breaks_if_blocked: "Ad-supported apps may show placeholder instead of ad"
+
+  - domain: rdx2.lgtvsdp.com
+    tier: 1
+    category: telemetry
+    why_block: "Recommendation engine analytics"
+    breaks_if_blocked: "TV may stop showing 'recommended for you' rows"
+
+  # ============================================================
+  # TIER 2 — Tracking-heavy services (you probably want these blocked)
+  # ============================================================
+
+  - regex: '(\.|^)avs\.amazon\.dev$'
+    tier: 2
+    category: voice-assistant
+    why_block: |
+      Alexa Voice Service. MODERN endpoint — moved here ~2024 from the older
+      avs-alexa-na.amazon.com / pitangui hosts. Most public adlists still block
+      the old endpoints; this one is the live one.
+    breaks_if_blocked: "Built-in Alexa stops working. Microphone button silent."
+    observed_via: "Zeek ssl.log on LG webOS p20.04.54.40 in May 2026"
+
+  - regex: '(\.|^)apl-alexa\.com$'
+    tier: 2
+    category: voice-assistant
+    why_block: "Alexa Presentation Language — visual responses for Alexa-on-TV"
+    breaks_if_blocked: "Alexa cards/visuals don't render"
+
+  - domain: alexa.amazon.es
+    tier: 2
+    category: voice-assistant
+    why_block: "Alexa account region (Spain)"
+    breaks_if_blocked: "Alexa setup wizard fails"
+
+  - domain: alexa.amazon.com
+    tier: 2
+    category: voice-assistant
+    why_block: "Alexa account global"
+    breaks_if_blocked: "Alexa stops working"
+
+  - domain: sonic.xapp.avs.amazon.dev
+    tier: 2
+    category: voice-assistant
+    why_block: "Alexa audio streaming"
+    breaks_if_blocked: "No Alexa voice replies"
+
+  - domain: arl.assets.apl-alexa.com
+    tier: 2
+    category: voice-assistant
+    why_block: "Alexa visual assets"
+    breaks_if_blocked: "Alexa cards have no icons"
+
+  - domain: discovery.meethue.com
+    tier: 2
+    category: integration
+    why_block: "Philips Hue bridge discovery from LG TV"
+    breaks_if_blocked: "Hue integration in TV stops (does NOT affect Hue app on phone)"
+
+  - domain: www.ueiwsp.com
+    tier: 2
+    category: integration
+    why_block: "UEI (Universal Electronics Inc) — IR/universal remote codes"
+    breaks_if_blocked: "TV remote 'magic remote' learning broken; physical remote still works"
+
+  - domain: ueiwsp.com
+    tier: 2
+    category: integration
+    why_block: "Same as above (apex)"
+    breaks_if_blocked: "Same"
+
+  - domain: avsxappcaptiveportal.com
+    tier: 2
+    category: voice-assistant
+    why_block: |
+      Amazon AVS connectivity probe (generate_204-style). UA 'AvsDeviceSdk/1.26.0'.
+      No data filtered (HTTP 204 empty body). If not using Alexa: safely blockable.
+    breaks_if_blocked: "Alexa-built-in connectivity probe fails; voice may show offline"
+
+  # ============================================================
+  # TIER 3 — Aggressive (breaks LG account / OTA / LG Channels)
+  # ============================================================
+
+  - regex: '(\.|^)lgtvcommon\.com$'
+    tier: 3
+    category: backbone
+    why_block: "Master TLD for LG TV backbone services"
+    breaks_if_blocked: "LG account login, EPG, LG Channels, OTA updates"
+
+  - regex: '(\.|^)lgtvsdp\.com$'
+    tier: 3
+    category: backbone
+    why_block: "LG Smart Device Platform — content discovery and recommendations"
+    breaks_if_blocked: "Home screen content rows fail"
+
+  - regex: '(\.|^)lgeapi\.com$'
+    tier: 3
+    category: account
+    why_block: "LG Electronics API"
+    breaks_if_blocked: "LG account, profile, sync"
+
+  - regex: '(\.|^)lgtviot\.com$'
+    tier: 3
+    category: iot
+    why_block: "LG ThinQ — smart home / IoT integration"
+    breaks_if_blocked: "LG ThinQ phone app stops controlling TV"
+
+  - regex: '(\.|^)lgthinq\.com$'
+    tier: 3
+    category: iot
+    why_block: "LG ThinQ cloud (alias)"
+    breaks_if_blocked: "Same as above"
+
+  - domain: snu.lge.com
+    tier: 3
+    category: updates
+    why_block: "Software/firmware update notifications"
+    breaks_if_blocked: "TV won't auto-prompt OTA updates (you'd have to update manually)"
+
+  - regex: '(\.|^)lgwebos\.com$'
+    tier: 3
+    category: updates
+    why_block: "webOS platform updates and CDN"
+    breaks_if_blocked: "OTA updates broken"
+
+  - regex: '(\.|^)lgtvonline\.com$'
+    tier: 3
+    category: lg-channels
+    why_block: "LG Channels (free ad-supported TV) backbone"
+    breaks_if_blocked: "LG Channels app stops working"
+
+# ============================================================
+# Notes for advanced users:
+# ============================================================
+# 1. LG TVs cache resolved IPs aggressively. Even after DNS blocking, the TV may
+#    keep connecting to old IPs for hours. nft drops at the L3 gateway address
+#    these cached connections.
+# 2. Cached LG cloud IPs seen in our data (Apr–May 2026, region EU):
+#      AWS Dublin:  52.209.196.19, 54.74.67.39, 52.16.104.93
+#      Azure:       13.66.142.97
+#    These show as MQTT TLS (:8883) connections always-on. Confirm in your own
+#    Zeek logs before drop — they may change region by region.
+# 3. Disable IPv6 in webOS Network settings. The L3 gateway only catches IPv4;
+#    IPv6 goes direct via the LAN.
+# 4. Streaming apps (Netflix, Prime Video, Disney+, Jellyfin, YouTube, Apple TV)
+#    are UNAFFECTED by Tier 1/2/3 of this template — they use their own domains.

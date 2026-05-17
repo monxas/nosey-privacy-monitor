@@ -1,0 +1,89 @@
+# Samsung Tizen TV blocklist template
+# =====================================
+# Tested patterns: Samsung Frame, QLED, Crystal series. Tizen OS 6+.
+# Samsung is even more aggressive than LG with ACR (Automatic Content Recognition).
+# Disable ACR in Settings → All Settings → Privacy → Reset, then add this template.
+
+name: samsung-tv
+description: "Samsung smart TVs running Tizen"
+default_tier: 2
+
+domains:
+
+  # ============================================================
+  # TIER 1 — Telemetry + ads
+  # ============================================================
+
+  - domain: samsungacr.com
+    tier: 1
+    category: acr
+    why_block: |
+      Automatic Content Recognition — fingerprints WHAT you watch (incl. from
+      HDMI inputs like a console!) and sends to Samsung/Inscape/Vizio. The most
+      invasive surveillance feature in modern TVs.
+    breaks_if_blocked: "Some smart features (content recommendations) reduced"
+
+  - regex: '(\.|^)samsungcloudsolution\.com$'
+    tier: 1
+    category: telemetry
+    why_block: "Samsung Cloud telemetry"
+    breaks_if_blocked: "Samsung account sync may degrade"
+
+  - regex: '(\.|^)samsungcloudsolution\.net$'
+    tier: 1
+    category: telemetry
+    why_block: "Samsung Cloud telemetry (alt TLD)"
+    breaks_if_blocked: "Same"
+
+  - regex: '(\.|^)samsungelectronics\.com$'
+    tier: 1
+    category: analytics
+    why_block: "Various Samsung analytics endpoints"
+    breaks_if_blocked: "Samsung account features may stutter"
+
+  - regex: '(\.|^)samsungrm\.net$'
+    tier: 1
+    category: ads
+    why_block: "Samsung Real-time Marketing"
+    breaks_if_blocked: "Home screen has fewer Samsung-pushed ads"
+
+  - regex: '(\.|^)samsungtifyads\.com$'
+    tier: 1
+    category: ads
+    why_block: "Samsung TV ads platform"
+    breaks_if_blocked: "Banner ads in Samsung apps gone"
+
+  - regex: '(\.|^)tvbeacon\.samsung\.com$'
+    tier: 1
+    category: telemetry
+    why_block: "Viewing beacon"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)tvads\.samsung\.com$'
+    tier: 1
+    category: ads
+    why_block: "TV ads server"
+    breaks_if_blocked: "Ads in TV Plus may not load"
+
+  # ============================================================
+  # TIER 2 — TV Plus (Samsung's free ad-supported live TV)
+  # ============================================================
+
+  - regex: '(\.|^)samsungtvplus\.com$'
+    tier: 2
+    category: tvplus
+    why_block: "Samsung TV Plus content metadata + recommendations"
+    breaks_if_blocked: "TV Plus app gets less responsive / no new channels"
+
+# ============================================================
+# Notes
+# ============================================================
+# Samsung devices are notorious for caching ACR endpoints by IP.
+# After blocking domains, check Zeek for connections to the cached IPs
+# and add nft drops for those specific IPs at the gateway.
+#
+# ACR data goes to two main partners: Inscape (Vizio-owned) and Samba TV.
+# Block their domains too if seen in your traffic:
+#   - inscapedata.com
+#   - samba.tv
+#   - samsungtvinsights.com  (note: this is Vizio actually)

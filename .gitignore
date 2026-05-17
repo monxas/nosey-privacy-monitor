@@ -1,0 +1,27 @@
+# Local config (keeps secrets out)
+config/nosey.yaml
+config/devices.yaml
+!config/*.example.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated
+*.bak
+*.bak-*
+/dist

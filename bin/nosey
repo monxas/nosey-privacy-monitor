@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+nosey — per-device privacy audit via L3 transparent gateway.
+
+Commands:
+  list                    Show the device registry.
+  add <name>              Add a device to the registry.
+  enable <name>           Enable monitoring (consent check applies).
+  disable <name>          Disable monitoring.
+  apply                   Sync state with DNS blocker + print device-side instructions.
+  status [name]           Health check: traffic seen, top SNIs, last-seen.
+  discover                Scan LAN + suggest devices based on MAC vendor.
+  wizard                  Interactive: scan → choose device → assign template → enable.
+
+Config is loaded from $NOSEY_CONFIG or ./config/nosey.yaml.
+Device registry is in the path declared by `registry:` in the config.
+
+Designed to work in two modes:
+  - standalone  (Pi-hole or AdGuard only — minimal deps)
+  - observability  (Loki + Grafana too — for power users)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Any
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write("pyyaml is required. Install with: pip install pyyaml\n")
+    sys.exit(2)
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG_LOCATIONS = [
+    os.environ.get("NOSEY_CONFIG"),
+    "./config/nosey.yaml",
+    os.path.expanduser("~/.config/nosey/nosey.yaml"),
+    "/etc/nosey/nosey.yaml",
+]
+
+
+def find_config() -> Path:
+    for p in DEFAULT_CONFIG_LOCATIONS:
+        if p and Path(p).exists():
+            return Path(p)
+    sys.stderr.write(
+        "ERR: no config found.\n"
+        "  Set $NOSEY_CONFIG or create ./config/nosey.yaml from config/nosey.example.yaml\n"
+    )
+    sys.exit(2)
+
+
+def expand_env(value: Any) -> Any:
+    """Replace `env:VAR_NAME` with os.environ[VAR_NAME]; recurse into dict/list."""
+    if isinstance(value, str) and value.startswith("env:"):
+        var = value[4:]
+        v = os.environ.get(var)
+        if v is None:
+            sys.stderr.write(f"ERR: env var {var} not set\n")
+            sys.exit(2)
+        return v
+    if isinstance(value, dict):
+        return {k: expand_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env(x) for x in value]
+    return value
+
+
+@dataclass
+class Config:
+    gateway_ip: str
+    gateway_dns: str
+    registry_path: Path
+    dns_backend: dict
+    observability: dict
+    self_owners: list[str] = field(default_factory=lambda: ["self"])
+
+    @classmethod
+    def load(cls) -> "Config":
+        path = find_config()
+        raw = yaml.safe_load(path.read_text()) or {}
+        raw = expand_env(raw)
+
+        gw = raw.get("gateway", {})
+        if not gw.get("ip") or not gw.get("dns"):
+            sys.stderr.write("ERR: config.gateway must define `ip` and `dns`\n")
+            sys.exit(2)
+
+        registry = raw.get("registry", "./config/devices.yaml")
+        # resolve relative to the config file
+        rpath = (path.parent / registry).resolve() if not Path(registry).is_absolute() else Path(registry)
+
+        return cls(
+            gateway_ip=gw["ip"],
+            gateway_dns=gw["dns"],
+            registry_path=rpath,
+            dns_backend=raw.get("dns_blocker", {}),
+            observability=raw.get("observability", {"enabled": False}),
+            self_owners=raw.get("self_owners", ["self"]),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Device registry
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Device:
+    ip: Optional[str] = None
+    mac: Optional[str] = None
+    owner: str = ""
+    enabled: bool = False
+    routing: str = "gateway-manual"  # gateway-manual | wireguard
+    template: Optional[str] = None   # e.g. lg-tv, iphone-ios
+    dns_group: str = ""              # name of Pi-hole/AdGuard group
+    dns_group_id: Optional[int] = None
+    consent_doc: Optional[str] = None
+    notes: str = ""
+
+
+def load_registry(cfg: Config) -> dict[str, Device]:
+    if not cfg.registry_path.exists():
+        return {}
+    raw = yaml.safe_load(cfg.registry_path.read_text()) or {}
+    out = {}
+    for name, attrs in (raw.get("devices") or {}).items():
+        attrs = dict(attrs)
+        # legacy fields normalised
+        if "pihole_group_name" in attrs and not attrs.get("dns_group"):
+            attrs["dns_group"] = attrs.pop("pihole_group_name")
+        if "pihole_group_id" in attrs and not attrs.get("dns_group_id"):
+            attrs["dns_group_id"] = attrs.pop("pihole_group_id")
+        # Only pass fields the dataclass knows about
+        known = {f.name for f in Device.__dataclass_fields__.values()}
+        attrs = {k: v for k, v in attrs.items() if k in known}
+        out[name] = Device(**attrs)
+    return out
+
+
+def save_registry(cfg: Config, devs: dict[str, Device]):
+    body = {
+        "devices": {
+            n: {k: v for k, v in asdict(d).items() if v not in (None, "", False) or k in ("enabled", "ip", "mac", "consent_doc", "dns_group_id")}
+            for n, d in devs.items()
+        }
+    }
+    cfg.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.registry_path.write_text(
+        "# nosey device registry (regenerated by `nosey` CLI)\n"
+        "# https://github.com/monxas/nosey-privacy-monitor\n\n"
+        + yaml.safe_dump(body, sort_keys=False, allow_unicode=True)
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP helper
+# ---------------------------------------------------------------------------
+
+def http(method: str, url: str, headers: dict | None = None, body=None, timeout=10):
+    data = None
+    if body is not None:
+        data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+        headers = {**(headers or {}), "Content-Type": "application/json"}
+    req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode()
+
+
+# ---------------------------------------------------------------------------
+# DNS backend abstraction
+# ---------------------------------------------------------------------------
+
+class DNSBackend:
+    """Abstract DNS group/client manager."""
+
+    def login(self) -> None: ...
+    def ensure_group(self, name: str, comment: str = "") -> int: ...
+    def ensure_client(self, ip: str, group_id: int, comment: str = "") -> None: ...
+    def remove_group(self, group_id: int) -> None: ...
+
+
+class PiholeBackend(DNSBackend):
+    """Pi-hole v6 REST API."""
+
+    def __init__(self, cfg: dict):
+        self.base = cfg.get("api_url", "http://pi.hole").rstrip("/")
+        self.password = cfg.get("password", "")
+        self.sid: Optional[str] = None
+
+    def login(self) -> None:
+        s, body = http("POST", f"{self.base}/api/auth", body={"password": self.password})
+        d = json.loads(body)
+        sess = d.get("session") or {}
+        self.sid = sess.get("sid")
+        if not self.sid:
+            raise RuntimeError(f"Pi-hole login failed: {d}")
+
+    def _call(self, method: str, path: str, body=None):
+        s, b = http(method, f"{self.base}{path}",
+                    headers={"X-FTL-SID": self.sid or ""}, body=body)
+        return s, (json.loads(b) if b else None)
+
+    def ensure_group(self, name: str, comment: str = "") -> int:
+        s, gd = self._call("GET", "/api/groups")
+        existing = {g["name"]: g for g in (gd or {}).get("groups", [])}
+        if name in existing:
+            return existing[name]["id"]
+        s, resp = self._call("POST", "/api/groups",
+                             body={"name": name, "comment": comment or f"nosey: {name}", "enabled": True})
+        # Pi-hole's response shape varies; handle both
+        groups = (resp or {}).get("groups") or []
+        if groups and "id" in groups[0]:
+            return groups[0]["id"]
+        # fallback: re-query
+        s, gd = self._call("GET", "/api/groups")
+        for g in (gd or {}).get("groups", []):
+            if g["name"] == name:
+                return g["id"]
+        raise RuntimeError(f"Pi-hole could not create/find group {name}")
+
+    def ensure_client(self, ip: str, group_id: int, comment: str = "") -> None:
+        s, cd = self._call("GET", f"/api/clients/{urllib.parse.quote(ip)}")
+        current = (cd or {}).get("clients") or []
+        if current:
+            groups = set(current[0].get("groups", []))
+            groups.update({0, group_id})  # always keep default group 0
+            self._call("PUT", f"/api/clients/{urllib.parse.quote(ip)}",
+                       body={"groups": sorted(groups), "comment": comment})
+        else:
+            self._call("POST", "/api/clients",
+                       body={"client": ip, "groups": [0, group_id], "comment": comment})
+
+    def remove_group(self, group_id: int) -> None:
+        self._call("DELETE", f"/api/groups/{group_id}")
+
+
+class AdguardBackend(DNSBackend):
+    """AdGuard Home REST API — minimal stub (PRs welcome)."""
+
+    def __init__(self, cfg: dict):
+        self.base = cfg.get("api_url", "http://localhost").rstrip("/")
+        self.auth = (cfg.get("username", "admin"), cfg.get("password", ""))
+
+    def login(self) -> None:
+        pass  # basic auth used per-request
+
+    def ensure_group(self, name: str, comment: str = "") -> int:
+        raise NotImplementedError("AdGuard Home backend not implemented yet. PRs welcome.")
+
+    def ensure_client(self, ip: str, group_id: int, comment: str = "") -> None:
+        raise NotImplementedError
+
+    def remove_group(self, group_id: int) -> None:
+        raise NotImplementedError
+
+
+def make_backend(cfg: Config) -> DNSBackend:
+    typ = (cfg.dns_backend.get("type") or "pihole").lower()
+    if typ == "pihole":
+        return PiholeBackend(cfg.dns_backend)
+    if typ == "adguard":
+        return AdguardBackend(cfg.dns_backend)
+    raise RuntimeError(f"Unknown DNS backend: {typ!r}")
+
+
+# ---------------------------------------------------------------------------
+# Observability (optional)
+# ---------------------------------------------------------------------------
+
+def loki_query(cfg: Config, query: str, start_ns: int, end_ns: int, limit=10):
+    base = cfg.observability.get("loki_url", "").rstrip("/")
+    if not base:
+        return None
+    url = (f"{base}/loki/api/v1/query_range?"
+           f"query={urllib.parse.quote(query)}&start={start_ns}&end={end_ns}&limit={limit}")
+    try:
+        s, b = http("GET", url, timeout=15)
+        return json.loads(b)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+def template_path(cfg: Config, template_name: str) -> Optional[Path]:
+    """Find templates/<name>.yaml relative to the config file."""
+    if not template_name:
+        return None
+    candidate = (cfg.registry_path.parent.parent / "templates" / f"{template_name}.yaml").resolve()
+    return candidate if candidate.exists() else None
+
+
+def load_template(cfg: Config, template_name: str) -> dict:
+    p = template_path(cfg, template_name)
+    if not p:
+        return {}
+    return yaml.safe_load(p.read_text()) or {}
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(cfg: Config, args):
+    devs = load_registry(cfg)
+    if not devs:
+        print("(registry empty — try `nosey wizard` to add your first device)")
+        return
+    print(f"{'NAME':<20} {'OWNER':<12} {'IP':<18} {'MAC':<20} {'ON':<4} {'TEMPLATE':<12} ROUTING")
+    for name, d in devs.items():
+        print(f"{name:<20} {d.owner:<12} {(d.ip or '-'):<18} {(d.mac or '-'):<20} "
+              f"{'✓' if d.enabled else '✗':<4} {(d.template or '-'):<12} {d.routing}")
+
+
+def cmd_add(cfg: Config, args):
+    devs = load_registry(cfg)
+    if args.name in devs:
+        print(f"ERR: device '{args.name}' already exists", file=sys.stderr)
+        return 1
+    devs[args.name] = Device(
+        ip=args.ip, mac=(args.mac.lower() if args.mac else None),
+        owner=args.owner, enabled=False,
+        routing=args.routing,
+        template=args.template,
+        dns_group=args.name,
+        consent_doc=args.consent_doc,
+        notes=(args.notes or ""),
+    )
+    save_registry(cfg, devs)
+    print(f"Added '{args.name}' (disabled). Next: `nosey enable {args.name}` + `nosey apply`.")
+
+
+def _toggle(cfg: Config, name: str, on: bool, force=False):
+    devs = load_registry(cfg)
+    if name not in devs:
+        print(f"ERR: '{name}' does not exist", file=sys.stderr)
+        return 1
+    d = devs[name]
+    if on and d.owner not in cfg.self_owners and not d.consent_doc and not force:
+        print(f"⛔ '{name}' (owner={d.owner!r}) requires consent_doc or --force.", file=sys.stderr)
+        print("   Monitoring third-party devices without documented consent is invasive.", file=sys.stderr)
+        print("   Options:", file=sys.stderr)
+        print("     1. Document consent in e.g. docs/consent-log-<owner>.md and reference it", file=sys.stderr)
+        print("        (set `consent_doc: docs/consent-log-<owner>.md` in devices.yaml)", file=sys.stderr)
+        print("     2. If the owner is yourself, set `owner:` to one of:", cfg.self_owners, file=sys.stderr)
+        print("     3. For legitimate debug urgencies: --force (auditable in git history)", file=sys.stderr)
+        return 1
+    d.enabled = on
+    save_registry(cfg, devs)
+    print(f"{'Enabled' if on else 'Disabled'} '{name}'. Run `nosey apply` to sync DNS backend.")
+
+
+def cmd_enable(cfg, args):
+    return _toggle(cfg, args.name, True, force=args.force)
+
+
+def cmd_disable(cfg, args):
+    return _toggle(cfg, args.name, False)
+
+
+def cmd_apply(cfg: Config, args):
+    devs = load_registry(cfg)
+    print(f"=== Syncing {sum(1 for d in devs.values() if d.enabled)} enabled device(s) with DNS backend ===\n")
+
+    backend = make_backend(cfg)
+    backend.login()
+
+    for name, d in devs.items():
+        if not d.enabled:
+            continue
+        gname = d.dns_group or name
+        gid = backend.ensure_group(gname, comment=f"nosey: {name}")
+        d.dns_group_id = gid
+        print(f"  group '{gname}' (id={gid})")
+        if d.ip:
+            backend.ensure_client(d.ip, gid, comment=f"nosey: {name}")
+            print(f"  client {d.ip} → groups [0, {gid}]")
+        # Apply template blocklist
+        if d.template:
+            tpl = load_template(cfg, d.template)
+            if tpl:
+                domains = tpl.get("domains", [])
+                print(f"  template '{d.template}' loaded: {len(domains)} domains (apply via your DNS backend UI)")
+            else:
+                print(f"  ⚠️  template '{d.template}' not found at templates/{d.template}.yaml")
+
+    save_registry(cfg, devs)
+
+    print("\n=== Per-device setup instructions ===")
+    for name, d in devs.items():
+        if not d.enabled:
+            continue
+        print(f"\n[{name}]  owner={d.owner}")
+        if d.routing == "gateway-manual":
+            print(f"  On the device, set Wi-Fi config to MANUAL:")
+            print(f"    Router (gateway):  {cfg.gateway_ip}")
+            print(f"    DNS:               {cfg.gateway_dns}")
+            print(f"  iOS:    Settings → Wi-Fi → ⓘ → 'Configure IP: Manual'")
+            print(f"  macOS:  System Settings → Network → Wi-Fi → Details → TCP/IP 'Manually'")
+            print(f"  Android: Wi-Fi network → Advanced → IP settings 'Static'")
+            print(f"  TVs:    Network settings → Advanced → IP / DNS Manual")
+        elif d.routing == "wireguard":
+            print(f"  Install a WireGuard client on the device with the profile for this peer.")
+            print(f"  Phase 2 feature: nft routing rules per peer-IP via gateway are not yet implemented.")
+        print(f"  Then wait 60s and run: nosey status {name}")
+
+
+def cmd_status(cfg: Config, args):
+    devs = load_registry(cfg)
+    targets = [(args.name, devs.get(args.name))] if args.name else [(n, d) for n, d in devs.items() if d.enabled]
+    if not targets:
+        print("(no enabled devices — try `nosey enable <name>`)")
+        return
+
+    if not cfg.observability.get("enabled"):
+        print("Observability disabled (Loki not configured). `nosey status` is limited.")
+        for name, d in targets:
+            print(f"  {name} ({d.ip if d else '?'}): enabled={d.enabled if d else '?'}")
+        return
+
+    now_ns = time.time_ns()
+    start_ns = now_ns - 3600 * 10**9
+    host_label = cfg.observability.get("gateway_host_label", "gateway")
+
+    for name, d in targets:
+        if d is None:
+            print(f"{name}: not in registry")
+            continue
+        if not d.ip:
+            print(f"{name}: no IP in registry — run `nosey discover` to find it")
+            continue
+        print(f"\n=== {name} ({d.ip}) ===")
+        q = f'{{host="{host_label}",log_type="conn"}} | json | id_orig_h="{d.ip}"'
+        res = loki_query(cfg, q, start_ns, now_ns, limit=5)
+        if res:
+            streams = res.get("data", {}).get("result", [])
+            n_events = sum(len(s.get("values", [])) for s in streams)
+            print(f"  conn events last 1h:  {n_events}")
+            if streams and streams[0].get("values"):
+                last_ts_ns = int(streams[0]["values"][-1][0])
+                ago = (now_ns - last_ts_ns) // 10**9
+                print(f"  last seen:            {ago}s ago")
+        q_ssl = f'{{host="{host_label}",log_type="ssl"}} | json | id_orig_h="{d.ip}" | line_format "{{{{.server_name}}}}"'
+        res = loki_query(cfg, q_ssl, start_ns, now_ns, limit=200)
+        if res:
+            snis = {}
+            for s in res.get("data", {}).get("result", []):
+                for v in s.get("values", []):
+                    sn = v[1].strip().strip('"')
+                    if sn and sn != "-":
+                        snis[sn] = snis.get(sn, 0) + 1
+            if snis:
+                print(f"  top SNIs (1h):")
+                for sn, n in sorted(snis.items(), key=lambda x: -x[1])[:10]:
+                    print(f"    {n:5}  {sn[:70]}")
+
+
+# Vendor OUI lookup (minimal — enough for common smart-home brands)
+OUI_HINTS = {
+    "ac:5a:f0": "LG Electronics", "00:1d:c5": "LG", "8c:de:f9": "LG",
+    "1c:f6:4c": "Apple", "ac:5f:3e": "Apple", "70:cd:60": "Apple", "f0:18:98": "Apple",
+    "78:ff:af": "Samsung", "00:12:fb": "Samsung", "c4:73:1e": "Samsung",
+    "ac:63:be": "Amazon (Echo)", "f0:81:73": "Amazon",
+    "3c:5c:c4": "Google", "f4:f5:d8": "Google", "f4:f5:e8": "Google Nest",
+    "00:24:e4": "Roku", "08:05:81": "Roku", "b8:a1:75": "Roku",
+}
+
+
+def cmd_discover(cfg: Config, args):
+    devs = load_registry(cfg)
+    known_ips = {d.ip for d in devs.values() if d.ip}
+    known_macs = {d.mac for d in devs.values() if d.mac}
+
+    print("Scanning LAN (this can take ~30s)…")
+    try:
+        out = subprocess.check_output(
+            ["nmap", "-sn", args.subnet],
+            stderr=subprocess.DEVNULL, timeout=120
+        ).decode()
+    except FileNotFoundError:
+        sys.stderr.write("ERR: nmap not installed (apt install nmap / brew install nmap)\n")
+        return 1
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("ERR: nmap timed out\n")
+        return 1
+
+    found = []
+    current_ip = None
+    for line in out.splitlines():
+        if line.startswith("Nmap scan report"):
+            parts = line.split()
+            current_ip = parts[-1].strip("()")
+        elif "MAC Address:" in line and current_ip:
+            parts = line.split()
+            mac = parts[2].lower()
+            vendor = " ".join(parts[3:]).strip("()")
+            found.append((current_ip, mac, vendor))
+            current_ip = None
+
+    print(f"\nFound {len(found)} devices on {args.subnet}\n")
+    print(f"{'IP':<18} {'MAC':<20} {'VENDOR':<30} HINT")
+    for ip, mac, vendor in sorted(found):
+        oui = mac[:8]
+        hint = OUI_HINTS.get(oui, "")
+        if ip in known_ips:
+            tag = f"→ already in registry"
+        elif mac in known_macs:
+            tag = f"→ MAC matches existing entry, different IP"
+        elif "apple" in vendor.lower() or hint.startswith("Apple"):
+            tag = "candidate: iphone-ios / macos / appletv"
+        elif "lg" in (vendor + hint).lower():
+            tag = "candidate: lg-tv"
+        elif "samsung" in (vendor + hint).lower():
+            tag = "candidate: samsung-tv"
+        elif "amazon" in (vendor + hint).lower():
+            tag = "candidate: echo-dot"
+        elif "google" in (vendor + hint).lower():
+            tag = "candidate: google-home"
+        elif "roku" in (vendor + hint).lower():
+            tag = "candidate: roku-tv"
+        else:
+            tag = "(unknown — set template manually)"
+        print(f"{ip:<18} {mac:<20} {vendor[:30]:<30} {tag}")
+
+
+def cmd_wizard(cfg: Config, args):
+    print("nosey wizard — interactive device add\n")
+    # Step 1: discover
+    if input("Run LAN discovery first? [Y/n] ").strip().lower() not in ("n", "no"):
+        cmd_discover(cfg, argparse.Namespace(subnet=args.subnet))
+        print()
+    name = input("Name for the new device (e.g. living-room-tv): ").strip()
+    if not name:
+        print("Aborted.")
+        return
+    ip = input("IP address (e.g. 192.168.0.50): ").strip() or None
+    mac = input("MAC address (optional): ").strip() or None
+    owner = input(f"Owner (one of {cfg.self_owners} or another name): ").strip() or cfg.self_owners[0]
+    print("\nAvailable templates:")
+    tpls = []
+    tpl_dir = (cfg.registry_path.parent.parent / "templates")
+    if tpl_dir.exists():
+        for f in sorted(tpl_dir.glob("*.yaml")):
+            tpls.append(f.stem)
+            print(f"  - {f.stem}")
+    template = input("Template (blank for none): ").strip() or None
+    notes = input("Notes (blank for none): ").strip()
+    consent = None
+    if owner not in cfg.self_owners:
+        consent = input(f"This is a non-self device. Path to consent_doc (blank to abort): ").strip() or None
+        if not consent:
+            print("Aborted — non-self devices require consent_doc.")
+            return
+
+    devs = load_registry(cfg)
+    devs[name] = Device(
+        ip=ip, mac=mac.lower() if mac else None, owner=owner, enabled=False,
+        routing="gateway-manual", template=template, dns_group=name,
+        consent_doc=consent, notes=notes,
+    )
+    save_registry(cfg, devs)
+    print(f"\n✓ Added '{name}'. Next:")
+    print(f"    nosey enable {name}")
+    print(f"    nosey apply")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    cfg = Config.load()
+
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="show registry").set_defaults(func=cmd_list)
+
+    a = sub.add_parser("add", help="add device")
+    a.add_argument("name")
+    a.add_argument("--ip"); a.add_argument("--mac")
+    a.add_argument("--owner", required=True)
+    a.add_argument("--routing", default="gateway-manual", choices=["gateway-manual", "wireguard"])
+    a.add_argument("--template", help="template name from templates/")
+    a.add_argument("--consent-doc", dest="consent_doc")
+    a.add_argument("--notes", default="")
+    a.set_defaults(func=cmd_add)
+
+    e = sub.add_parser("enable", help="enable device (consent check)")
+    e.add_argument("name")
+    e.add_argument("--force", action="store_true", help="bypass consent check (auditable)")
+    e.set_defaults(func=cmd_enable)
+
+    d = sub.add_parser("disable", help="disable device")
+    d.add_argument("name")
+    d.set_defaults(func=cmd_disable)
+
+    sub.add_parser("apply", help="sync DNS backend + print instructions").set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("status", help="health check")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_status)
+
+    disc = sub.add_parser("discover", help="nmap LAN + suggest devices")
+    disc.add_argument("--subnet", default="192.168.0.0/24")
+    disc.set_defaults(func=cmd_discover)
+
+    w = sub.add_parser("wizard", help="interactive add")
+    w.add_argument("--subnet", default="192.168.0.0/24")
+    w.set_defaults(func=cmd_wizard)
+
+    args = p.parse_args()
+    sys.exit(args.func(cfg, args) or 0)
+
+
+if __name__ == "__main__":
+    main()

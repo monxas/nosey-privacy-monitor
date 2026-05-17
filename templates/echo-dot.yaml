@@ -1,0 +1,73 @@
+# Amazon Echo (Echo Dot, Echo Show, etc.) blocklist template
+# ============================================================
+# Echo devices are CHATTY. They keep persistent MQTT TLS to AWS even when idle.
+# Tier 1 keeps Alexa working. Tier 2 cuts most telemetry. Tier 3 cripples device.
+
+name: echo-dot
+description: "Amazon Echo Dot / Echo / Echo Show"
+default_tier: 2
+
+domains:
+
+  # ============================================================
+  # TIER 1 — Ads + telemetry (safe to block)
+  # ============================================================
+
+  - regex: '(\.|^)amazon-adsystem\.com$'
+    tier: 1
+    category: ads
+    why_block: "Amazon ad serving"
+    breaks_if_blocked: "Some skill recommendations may not show"
+
+  - regex: '(\.|^)assoc-amazon\.com$'
+    tier: 1
+    category: ads
+    why_block: "Amazon Associates tracking"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - domain: device-metrics-us.amazon.com
+    tier: 1
+    category: telemetry
+    why_block: "Device usage metrics"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - domain: device-metrics-us-2.amazon.com
+    tier: 1
+    category: telemetry
+    why_block: "Secondary device metrics"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - domain: dcape-na.amazon.com
+    tier: 1
+    category: telemetry
+    why_block: "Crash + diagnostic telemetry"
+    breaks_if_blocked: "Nothing user-visible"
+
+  # ============================================================
+  # TIER 2 — Optional services
+  # ============================================================
+
+  - regex: '(\.|^)amazon\.es$'
+    tier: 2
+    category: shopping
+    why_block: "Block 'order via Alexa' shopping flow"
+    breaks_if_blocked: "'Alexa, order paper towels' stops working"
+
+# ============================================================
+# DO NOT BLOCK — critical Alexa
+# ============================================================
+# Listed for awareness, NOT in block list:
+#   - avs-alexa-na.amazon.com    (Alexa Voice Service)
+#   - dpu-na.amazon.com          (device upload, like images)
+#   - api.amazonalexa.com
+#   - pitangui.amazon.com
+#   - latinum.amazon.com
+#   - apl-alexa.com (Alexa Presentation Language for Show devices)
+
+# ============================================================
+# Notes
+# ============================================================
+# Echo devices have a hardcoded fallback DNS (8.8.8.8) at the BOOT level.
+# Pi-hole alone won't catch this — combine with nft DROP at the gateway
+# for 8.8.8.8:53 from the Echo's IP. See `bin/doh-killer` and
+# `docs/playbooks/echo.md` for the full lockdown.

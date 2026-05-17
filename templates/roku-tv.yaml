@@ -1,0 +1,53 @@
+# Roku TV / Roku stick blocklist template
+# =========================================
+# Roku is one of the worst offenders for cross-device tracking + ACR.
+# Their business model is ads, not hardware sales. Block accordingly.
+
+name: roku-tv
+description: "Roku TVs and Roku streaming devices"
+default_tier: 2
+
+domains:
+
+  - regex: '(\.|^)scribe\.logs\.roku\.com$'
+    tier: 1
+    category: telemetry
+    why_block: "Roku's central logging — events, viewing, app interactions"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)preferences-stats\.sr\.roku\.com$'
+    tier: 1
+    category: telemetry
+    why_block: "User preferences stats"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)cooper\.logs\.roku\.com$'
+    tier: 1
+    category: telemetry
+    why_block: "App-level analytics"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)adv\.logs\.roku\.com$'
+    tier: 1
+    category: ads
+    why_block: "Ad engagement tracking"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)adv\.roku\.com$'
+    tier: 1
+    category: ads
+    why_block: "Roku ad serving"
+    breaks_if_blocked: "Ads in The Roku Channel + screensaver ads gone"
+
+  - regex: '(\.|^)scribe-collect\.roku\.com$'
+    tier: 1
+    category: telemetry
+    why_block: "Aggregation telemetry endpoint"
+    breaks_if_blocked: "Nothing user-visible"
+
+# ============================================================
+# Roku ACR
+# ============================================================
+# Like Samsung, Roku does ACR fingerprinting. The endpoints rotate; you'll
+# need to find them in your own Zeek logs (look for `roku.com` subdomains
+# you don't recognise, and IPs in 35.x.x.x range AWS).

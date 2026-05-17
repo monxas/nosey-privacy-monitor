@@ -1,0 +1,180 @@
+# iPhone / iPad (iOS) blocklist template
+# ========================================
+# Tested with iPhone 16 Pro on iOS 18, May 2026.
+# Conservative — Apple devices break in subtle ways if you over-block.
+#
+# Crucial pre-step:
+#   - Settings → Wi-Fi → ⓘ → 'Private Wi-Fi Address' OFF (so MAC stays stable)
+#   - Settings → Privacy → Apple Advertising → Personalized Ads OFF
+#   - Settings → General → AirDrop → Receiving Off (saves traffic)
+#   - If using Pi-hole: disable 'iCloud Private Relay' (Settings → [your name] →
+#     iCloud → Private Relay), otherwise Apple's DNS-over-HTTPS bypasses your blocker.
+
+name: iphone-ios
+description: "iPhones and iPads on iOS 17–18"
+default_tier: 2
+
+domains:
+
+  # ============================================================
+  # TIER 1 — Third-party ad/tracking SDKs (common in news/social apps)
+  # ============================================================
+
+  - regex: '(\.|^)adobedc\.net$'
+    tier: 1
+    category: analytics
+    why_block: "Adobe Analytics — embedded in many news/media apps"
+    breaks_if_blocked: "Nothing user-visible (analytics only)"
+
+  - regex: '(\.|^)mrf\.io$'
+    tier: 1
+    category: a-b-testing
+    why_block: "Marfeel — A/B testing + experience experiments. Heavy on news sites"
+    breaks_if_blocked: "News site reading still works, no UI experiments"
+
+  - regex: '(\.|^)sensic\.net$'
+    tier: 1
+    category: analytics
+    why_block: "Sensic — audience measurement"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)branch\.io$'
+    tier: 1
+    category: attribution
+    why_block: "Branch — deep link attribution"
+    breaks_if_blocked: "Universal links from email/web to apps may not pre-personalise"
+
+  - regex: '(\.|^)adjust\.com$'
+    tier: 1
+    category: attribution
+    why_block: "Adjust — install/event attribution SDK"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)appsflyer\.com$'
+    tier: 1
+    category: attribution
+    why_block: "AppsFlyer — mobile attribution"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)mixpanel\.com$'
+    tier: 1
+    category: analytics
+    why_block: "Mixpanel — product analytics"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)segment\.io$'
+    tier: 1
+    category: analytics
+    why_block: "Segment — analytics router (CDP)"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)amplitude\.com$'
+    tier: 1
+    category: analytics
+    why_block: "Amplitude — product analytics"
+    breaks_if_blocked: "Nothing user-visible"
+
+  # ============================================================
+  # TIER 2 — Meta/Google tracking (you probably want these)
+  # ============================================================
+
+  - regex: '(\.|^)facebook\.com$'
+    tier: 2
+    category: meta
+    why_block: "Meta Graph + tracking pixels"
+    breaks_if_blocked: "Facebook/Instagram apps stop working"
+    note: "Only block if you DON'T use Meta apps"
+
+  - regex: '(\.|^)graph\.facebook\.com$'
+    tier: 2
+    category: meta
+    why_block: "Meta Graph API — used by many third-party apps for Facebook login"
+    breaks_if_blocked: "'Login with Facebook' button broken in third-party apps"
+
+  - regex: '(\.|^)fbcdn\.net$'
+    tier: 2
+    category: meta
+    why_block: "Facebook CDN — images, videos"
+    breaks_if_blocked: "FB/IG content doesn't load"
+    note: "Only block if you DON'T use Meta apps"
+
+  - regex: '(\.|^)google-analytics\.com$'
+    tier: 2
+    category: google
+    why_block: "Google Analytics tracking"
+    breaks_if_blocked: "Nothing user-visible"
+
+  - regex: '(\.|^)doubleclick\.net$'
+    tier: 2
+    category: google
+    why_block: "Google ad serving"
+    breaks_if_blocked: "Ads on websites don't load"
+
+  - regex: '(\.|^)googletagmanager\.com$'
+    tier: 2
+    category: google
+    why_block: "Google Tag Manager"
+    breaks_if_blocked: "Nothing user-visible"
+
+  # ============================================================
+  # TIER 3 — Apple background services (only block knowing what breaks)
+  # ============================================================
+
+  - domain: gs-loc.apple.com
+    tier: 3
+    category: apple-location
+    why_block: |
+      Apple location service — used by 'Significant Locations', Find My, weather widget.
+      iOS calls this very frequently (~17/hr observed).
+    breaks_if_blocked: |
+      - Find My iPhone less accurate
+      - Significant Locations stops updating
+      - Weather widget location may stale
+      - 'Hey Siri' geographic features may degrade
+
+  - domain: gdmf.apple.com
+    tier: 3
+    category: apple-mdm
+    why_block: "Global Device Management Foundation — config signing"
+    breaks_if_blocked: "MDM profile updates fail, iOS update prompts may stop"
+
+  - domain: mask-api.icloud.com
+    tier: 3
+    category: apple-relay
+    why_block: "iCloud Private Relay (DNS over Oblivious HTTP)"
+    breaks_if_blocked: "Private Relay disabled — but this is what you WANT for Pi-hole visibility"
+    note: "Recommended: disable Private Relay in Settings instead of blocking the domain"
+
+  - domain: mesu.apple.com
+    tier: 3
+    category: apple-updates
+    why_block: "Apple software update server"
+    breaks_if_blocked: "iOS won't notify of new updates (must check manually)"
+
+  # ============================================================
+  # NEVER BLOCK — critical Apple services
+  # ============================================================
+  # Listed here as reminders, NOT in `domains` (would break too much):
+  #   - apple.com (general)
+  #   - icloud.com (sync, mail, photos)
+  #   - imessage.apple.com (iMessage)
+  #   - apns.courier.push.apple.com (push notifications)
+  #   - itunes.apple.com (App Store)
+  #   - captive.apple.com (network connectivity check)
+  #   - time.apple.com (NTP)
+  # These are NOT in the block list. If you accidentally add them, your iPhone
+  # gets unhappy fast.
+
+# ============================================================
+# Observed (May 2026, iPhone 16 Pro normal usage)
+# ============================================================
+# In one hour of normal use: ~270 distinct SNI destinations.
+# Top tracking categories (in this template, all blocked):
+#   - Marfeel (mrf.io) — news A/B testing — 4 distinct SNIs
+#   - Adobe Analytics — 1 SNI per news/media app
+#   - Sensic — measurement
+#   - Branch.io — attribution
+# Other heavy categories (NOT blocked — user choice):
+#   - Reddit (cf.gql-fed.reddit.com etc.) — Reddit app
+#   - Apple background — 270+ requests/hr, mostly legit
+#   - iCloud sync — gateway.icloud.com (frequent)

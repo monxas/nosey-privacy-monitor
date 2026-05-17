@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pyyaml
+      - name: nosey --help
+        run: |
+          export NOSEY_CONFIG=config/nosey.example.yaml
+          cp config/devices.example.yaml config/devices.yaml
+          bin/nosey --help
+      - name: nosey list (empty smoke)
+        run: |
+          export NOSEY_CONFIG=config/nosey.example.yaml
+          bin/nosey list

@@ -1,0 +1,95 @@
+# DoH/DoT/DoQ killer — block well-known encrypted DNS endpoints
+# ===============================================================
+# Smart devices increasingly use DNS-over-HTTPS or DNS-over-TLS to BYPASS
+# your Pi-hole. The hostnames don't appear in your queries; they go direct
+# to Cloudflare/Google/Quad9 over TCP/443.
+#
+# This is NOT a Pi-hole domain template — it's a set of IP DROP rules to apply
+# at the nftables level on your monitoring gateway.
+#
+# Apply with: scripts/install-nft-doh-killer.sh
+#
+# The list is conservative — only IPs that are unambiguously DoH/DoT-only.
+# Adding regular Cloudflare/Google IPs would break a lot. We target the
+# well-known DNS service endpoints.
+
+name: doh-doq-killer
+description: "nftables IP drops for well-known encrypted DNS resolvers"
+
+drops:
+
+  # TCP/UDP 853 (DoT, DoQ) — universal kill
+  - port: 853
+    protocols: [tcp, udp]
+    why: "RFC 7858 DoT, RFC 9250 DoQ. No legitimate device should need 853 outbound when you run your own resolver."
+
+  # Cloudflare DNS over HTTPS (1.1.1.1 family) on 443
+  - ips:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 2606:4700:4700::1111
+      - 2606:4700:4700::1001
+    ports: [443]
+    protocols: [tcp, udp]
+    why: "Cloudflare public DNS — DoH and DoT termination"
+
+  # Google Public DNS on 443
+  - ips:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 2001:4860:4860::8888
+      - 2001:4860:4860::8844
+    ports: [443]
+    protocols: [tcp, udp]
+    why: "Google public DNS DoH endpoints"
+
+  # Quad9
+  - ips:
+      - 9.9.9.9
+      - 149.112.112.112
+      - 2620:fe::fe
+      - 2620:fe::9
+    ports: [443]
+    protocols: [tcp, udp]
+    why: "Quad9 DoH"
+
+  # OpenDNS
+  - ips:
+      - 208.67.222.222
+      - 208.67.220.220
+    ports: [443]
+    protocols: [tcp, udp]
+    why: "OpenDNS DoH"
+
+  # AdGuard public DNS
+  - ips:
+      - 94.140.14.14
+      - 94.140.15.15
+    ports: [443]
+    protocols: [tcp, udp]
+    why: "AdGuard DNS DoH"
+
+  # NextDNS popular DoH endpoint hosts (subset)
+  - domains:
+      - dns.nextdns.io
+    why: |
+      Resolve to current NextDNS IPs and drop. Add a daily cron to refresh.
+
+  # Apple iCloud Private Relay DoH endpoint
+  - domains:
+      - mask.icloud.com
+      - mask-h2.icloud.com
+      - mask-api.icloud.com
+    why: |
+      iOS 'Private Relay' obfuscates DNS via Apple. Devices in this network
+      should disable Private Relay (Settings → iCloud → Private Relay OFF)
+      OR have these resolved+dropped. Without doing either, your Pi-hole
+      sees no queries from the iPhone.
+
+# ============================================================
+# WARNING — false positives
+# ============================================================
+# 1.1.1.1 / 8.8.8.8 are also used by some devices for NTP-over-HTTPS, captive
+# portal checks, and connectivity probes. After applying these drops, monitor
+# Zeek for SYN attempts to those IPs from devices you care about. Usually
+# legitimate apps fall back to OS resolver (which goes through your Pi-hole).

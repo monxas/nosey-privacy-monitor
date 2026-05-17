@@ -1,0 +1,39 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install ruff pyyaml
+      - name: ruff check
+        run: ruff check bin/
+      - name: yaml validate templates
+        run: |
+          python - <<'PY'
+          import yaml, glob, sys
+          ok = True
+          for f in sorted(glob.glob('templates/*.yaml') + glob.glob('config/*.example.yaml')):
+              try:
+                  yaml.safe_load(open(f))
+                  print(f"  ✓ {f}")
+              except yaml.YAMLError as e:
+                  print(f"  ✗ {f}: {e}")
+                  ok = False
+          sys.exit(0 if ok else 1)
+          PY
+
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y shellcheck
+      - run: shellcheck scripts/*.sh

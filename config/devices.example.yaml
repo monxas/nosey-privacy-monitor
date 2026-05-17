@@ -1,0 +1,44 @@
+# Example device registry
+# =========================
+# Copy to devices.yaml (or wherever your config's `registry:` points) and edit.
+
+devices:
+
+  # Example: your own iPhone (no consent_doc needed — owner is "self")
+  my-iphone:
+    ip: 192.168.0.50
+    mac: aa:bb:cc:dd:ee:ff
+    owner: self
+    enabled: false
+    routing: gateway-manual
+    template: iphone-ios
+    dns_group: my-iphone
+    notes: |
+      iPhone 16 Pro. Once enabled, configure WiFi → Router=GATEWAY_IP manually.
+      Remember to also disable "Private Wi-Fi Address" so MAC stays stable.
+
+  # Example: a smart TV in the household
+  living-room-tv:
+    ip: 192.168.0.227
+    mac: ac:5a:f0:11:22:33
+    owner: family
+    enabled: false
+    routing: gateway-manual
+    template: lg-tv
+    dns_group: living-room-tv
+    consent_doc: null            # household device, no specific person
+    notes: |
+      LG webOS TV. Disable IPv6 in webOS Network settings — it bypasses the gateway.
+
+  # Example: a partner's device — REQUIRES consent_doc to enable.
+  partner-iphone:
+    ip: 192.168.0.51
+    mac: 11:22:33:44:55:66
+    owner: partner
+    enabled: false
+    routing: gateway-manual
+    template: iphone-ios
+    consent_doc: docs/consent-log-partner.md  # must exist before `nosey enable` works
+    notes: |
+      Owned by partner. Consent documented in docs/consent-log-partner.md
+      with date, scope, kill-switch.

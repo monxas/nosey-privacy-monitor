@@ -1,0 +1,38 @@
+# Nosey main config
+# ====================
+# Copy to ./config/nosey.yaml (or set NOSEY_CONFIG=/path/to/file) and edit.
+
+# The L3 monitoring gateway: a small Linux box (Proxmox LXC, Raspberry Pi, NUC)
+# running nftables (masquerade) + Zeek (sniffer). Devices opting in will be
+# configured to use this host as their default WiFi router/gateway.
+gateway:
+  ip: 192.168.0.210            # gateway host IP on your LAN
+  dns: 192.168.0.204            # DNS server devices should use (your Pi-hole / AdGuard)
+
+# Path to the device registry (relative to this config file or absolute).
+registry: ./devices.yaml
+
+# DNS blocker — where Nosey creates per-device groups + clients.
+# Supported backends: pihole, adguard (in progress).
+dns_blocker:
+  type: pihole
+  api_url: http://192.168.0.204:8080
+  # Use env: prefix to read from environment variable (recommended for passwords).
+  password: env:PIHOLE_PASSWORD
+
+# Observability is OPTIONAL. If you don't have Loki/Grafana, disable this block;
+# Nosey will work in standalone mode (you still get DNS blocking + Zeek logs on disk).
+observability:
+  enabled: false
+  loki_url: http://192.168.0.208:3101
+  grafana_url: http://192.168.0.208:3030
+  # Label used by promtail for the gateway host. Defaults to "gateway".
+  gateway_host_label: tv-gw
+
+# Owners considered "yourself" — devices with these `owner:` values do not
+# require a consent_doc to enable. Anything else does.
+self_owners:
+  - self
+  - me
+  # add your own usernames if you like:
+  # - ramon
