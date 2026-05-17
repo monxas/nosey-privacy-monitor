@@ -13,6 +13,8 @@ Commands:
   wizard                  Interactive: scan → choose device → assign template → enable.
   serve [--host --port]   Launch the web UI bridge (FastAPI + HTMX) — apply templates,
                           push rules to Pi-hole, watch per-device stats.
+  capture <name> [...]    Pull Zeek logs from the gateway, generate a markdown
+                          forensic report (SNI / IPs / bytes / cadence / TLS posture).
 
 Config is loaded from $NOSEY_CONFIG or ./config/nosey.yaml.
 Device registry is in the path declared by `registry:` in the config.
@@ -629,6 +631,211 @@ def cmd_wizard(cfg: Config, args):
 
 
 # ---------------------------------------------------------------------------
+# Capture mode — Zeek logs → markdown forensic report (no MITM)
+# ---------------------------------------------------------------------------
+
+def _zeek_fetch(cmd_template: str, log_name: str) -> list[dict]:
+    """Run a shell command (with {log} substituted) on the gateway and parse JSON lines."""
+    import statistics  # noqa: F401  (used by report builder)
+    cmd = cmd_template.format(log=log_name)
+    try:
+        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=30)
+    except subprocess.CalledProcessError:
+        return []
+    except subprocess.TimeoutExpired:
+        return []
+    rows = []
+    for line in out.decode(errors="replace").splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+    return rows
+
+
+def _build_capture_report(device_ip: str, window_min: int,
+                          ssl_d: list, conn_d: list, quic_d: list, http_d: list) -> str:
+    import statistics
+    from collections import Counter, defaultdict
+    from datetime import datetime
+
+    now = time.time()
+    cutoff = now - window_min * 60
+
+    def keep(rows):
+        out, seen = [], set()
+        for r in rows:
+            if r.get("id.orig_h") != device_ip:
+                continue
+            if r.get("ts", 0) < cutoff:
+                continue
+            uid = r.get("uid") or r.get("fuid") or ""
+            if uid and uid in seen:
+                continue
+            if uid:
+                seen.add(uid)
+            out.append(r)
+        return out
+
+    ssl_d, conn_d, quic_d, http_d = keep(ssl_d), keep(conn_d), keep(quic_d), keep(http_d)
+
+    snis = Counter()
+    sni_by_dest: dict[str, set] = defaultdict(set)
+    tls_versions: Counter = Counter()
+    ciphers: Counter = Counter()
+    curves: Counter = Counter()
+    established = failed = 0
+    for r in ssl_d:
+        sni = r.get("server_name") or "(no SNI)"
+        snis[sni] += 1
+        sni_by_dest[r.get("id.resp_h", "?")].add(sni)
+        tls_versions[r.get("version", "?")] += 1
+        ciphers[r.get("cipher", "?")] += 1
+        curves[r.get("curve", "?")] += 1
+        if r.get("established"):
+            established += 1
+        else:
+            failed += 1
+
+    dest_up: dict[str, int] = defaultdict(int)
+    dest_dn: dict[str, int] = defaultdict(int)
+    dest_pkts: dict[str, int] = defaultdict(int)
+    dest_proto: dict[str, set] = defaultdict(set)
+    dest_port: dict[str, set] = defaultdict(set)
+    durations = []
+    cadence: Counter = Counter()
+    for r in conn_d:
+        dst = r.get("id.resp_h", "?")
+        dest_up[dst] += r.get("orig_ip_bytes", 0)
+        dest_dn[dst] += r.get("resp_ip_bytes", 0)
+        dest_pkts[dst] += r.get("orig_pkts", 0) + r.get("resp_pkts", 0)
+        dest_proto[dst].add(r.get("proto", "?"))
+        dest_port[dst].add(r.get("id.resp_p", 0))
+        if r.get("duration"):
+            durations.append(r["duration"])
+        cadence[int(r["ts"]) // 60] += 1
+
+    quic_snis = Counter(r.get("server_name", "(none)") for r in quic_d)
+    total_up = sum(dest_up.values())
+    total_dn = sum(dest_dn.values())
+
+    out = []
+    out.append(f"# Nosey capture report — {device_ip}")
+    out.append(f"_Window: last {window_min} min "
+               f"({datetime.fromtimestamp(cutoff).isoformat(timespec='seconds')} → "
+               f"{datetime.fromtimestamp(now).isoformat(timespec='seconds')})_\n")
+    out.append("## Summary\n")
+    out.append("| Metric | Value |")
+    out.append("| --- | --- |")
+    out.append(f"| Connections (L4) | **{len(conn_d):,}** |")
+    out.append(f"| TLS handshakes | **{len(ssl_d):,}** (established: {established}, failed/RST: {failed}) |")
+    out.append(f"| QUIC (HTTP/3) sessions | **{len(quic_d):,}** |")
+    out.append(f"| Plaintext HTTP | **{len(http_d):,}** |")
+    out.append(f"| Bytes uploaded | **{total_up/1024:,.1f} KB** |")
+    out.append(f"| Bytes downloaded | **{total_dn/1024:,.1f} KB** |")
+    out.append(f"| Unique destinations (IP) | **{len(dest_up):,}** |")
+    out.append(f"| Unique SNIs | **{len(snis):,}** |\n")
+
+    out.append("## Top 25 SNIs (TLS hostnames the device asked for)\n")
+    out.append("| # | SNI | Connections |")
+    out.append("| --- | --- | --- |")
+    for i, (sni, n) in enumerate(snis.most_common(25), 1):
+        out.append(f"| {i} | `{sni}` | {n} |")
+    out.append("")
+
+    out.append("## Top 15 destination IPs (by bytes)\n")
+    out.append("| IP | Up KB | Down KB | Packets | Ports | Proto | SNIs seen |")
+    out.append("| --- | ---: | ---: | ---: | --- | --- | --- |")
+    for ip, bdn in sorted(dest_dn.items(), key=lambda x: -x[1])[:15]:
+        bup = dest_up.get(ip, 0)
+        pkts = dest_pkts.get(ip, 0)
+        ports = ",".join(str(p) for p in sorted(dest_port[ip]))[:30]
+        protos = ",".join(sorted(dest_proto[ip]))
+        snis_here = ", ".join(list(sni_by_dest[ip])[:3])[:60]
+        out.append(f"| {ip} | {bup/1024:,.1f} | {bdn/1024:,.1f} | {pkts:,} | {ports} | {protos} | {snis_here} |")
+    out.append("")
+
+    out.append("## TLS posture\n")
+    out.append(f"- **TLS versions**: " + ", ".join(f"{k}: {n}" for k, n in tls_versions.most_common()))
+    out.append(f"- **Ciphers**: " + ", ".join(f"{k}: {n}" for k, n in ciphers.most_common(5)))
+    out.append(f"- **Curves**: " + ", ".join(f"{k}: {n}" for k, n in curves.most_common(5)))
+    if "X25519MLKEM768" in curves:
+        out.append("- 🆕 Post-quantum hybrid `X25519MLKEM768` observed — iOS 18+ / macOS 15+ behavior.")
+    out.append("")
+
+    out.append("## Cadence — connections per minute (heartbeat detection)\n")
+    if cadence:
+        counts = list(cadence.values())
+        out.append(f"- Mean: **{statistics.mean(counts):.1f}** conn/min  · Max: {max(counts)}  · Min: {min(counts)}")
+        if len(counts) >= 5 and statistics.pstdev(counts) < statistics.mean(counts) * 0.3:
+            out.append("- ⚠️ Low variance → looks like a steady background heartbeat, not user-driven activity.")
+    if durations:
+        out.append(f"- Connection duration: median {statistics.median(durations):.2f}s, "
+                   f"p95 {sorted(durations)[int(0.95*len(durations))]:.2f}s")
+    out.append("")
+
+    if quic_snis:
+        out.append("## QUIC / HTTP/3 top SNIs\n")
+        for sni, n in quic_snis.most_common(10):
+            out.append(f"- `{sni}` × {n}")
+        out.append("")
+
+    if http_d:
+        out.append("## ⚠️ Plaintext HTTP (anything here means a leaky endpoint)\n")
+        for h in http_d[:20]:
+            out.append(f"- `{h.get('method','?')} {h.get('host','?')}{h.get('uri','/')}` → {h.get('status_code','?')}")
+        out.append("")
+
+    out.append("---\n")
+    out.append(f"_Generated by `nosey capture` · device {device_ip} · "
+               f"{datetime.now().isoformat(timespec='seconds')}_\n")
+    out.append("_Based on **passive observation** — no TLS decryption, no MITM, no custom CA._")
+    return "\n".join(out)
+
+
+def cmd_capture(cfg: Config, args):
+    devs = load_registry(cfg)
+    if args.name not in devs:
+        sys.stderr.write(f"ERR: device {args.name!r} not in registry\n")
+        return 1
+    d = devs[args.name]
+    if not d.ip:
+        sys.stderr.write(f"ERR: device {args.name} has no IP\n")
+        return 1
+
+    fetch_cmd = (cfg.dns_backend.get("zeek_fetch_cmd") or
+                 os.environ.get("NOSEY_ZEEK_FETCH_CMD") or
+                 f"ssh root@{cfg.gateway_ip} 'cat /opt/zeek/logs/current/{{log}}'")
+    # also allow gateway.zeek_fetch_cmd top-level
+    raw = yaml.safe_load(find_config().read_text()) or {}
+    raw_gw = (raw.get("gateway") or {}).get("zeek_fetch_cmd")
+    if raw_gw:
+        fetch_cmd = raw_gw
+
+    print(f"Capturing for {args.name} ({d.ip}), window={args.window}min …", file=sys.stderr)
+    print(f"  using: {fetch_cmd.replace('{log}', '<log>')}", file=sys.stderr)
+
+    ssl_d = _zeek_fetch(fetch_cmd, "ssl.log")
+    conn_d = _zeek_fetch(fetch_cmd, "conn.log")
+    quic_d = _zeek_fetch(fetch_cmd, "quic.log")
+    http_d = _zeek_fetch(fetch_cmd, "http.log")
+
+    if not (ssl_d or conn_d):
+        sys.stderr.write("ERR: no Zeek logs returned. Check `gateway.zeek_fetch_cmd` in config.\n")
+        return 1
+
+    report = _build_capture_report(d.ip, args.window, ssl_d, conn_d, quic_d, http_d)
+
+    if args.out:
+        Path(args.out).write_text(report)
+        print(f"\nReport written to {args.out}", file=sys.stderr)
+    else:
+        print(report)
+
+
+# ---------------------------------------------------------------------------
 # Template diff (used by `nosey serve` UI bridge)
 # ---------------------------------------------------------------------------
 
@@ -1131,6 +1338,12 @@ def main():
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8765)
     sv.set_defaults(func=cmd_serve)
+
+    cap = sub.add_parser("capture", help="passive forensic report from Zeek logs (no MITM)")
+    cap.add_argument("name", help="device name in registry")
+    cap.add_argument("--window", type=int, default=30, help="minutes to analyze (default 30)")
+    cap.add_argument("--out", help="write report to file instead of stdout")
+    cap.set_defaults(func=cmd_capture)
 
     args = p.parse_args()
     sys.exit(args.func(cfg, args) or 0)

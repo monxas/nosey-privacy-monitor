@@ -37,6 +37,7 @@ This repo is the tooling + the curated blocklists. Bring your own Pi-hole or AdG
 
 - 📋 **Device registry** as YAML — one file, one source of truth.
 - 🌐 **Web UI bridge** — `nosey serve` launches a local dashboard (FastAPI + HTMX) that pulls Pi-hole stats and **pushes template rules to Pi-hole groups with a diff/confirm flow**. No more copy-pasting blocklists into the Pi-hole admin.
+- 🔬 **Forensic capture mode** — `nosey capture <device>` pulls Zeek logs from the gateway and emits a markdown report with top SNIs, IPs, bytes, TLS posture, and cadence (heartbeat detection). No MITM, no custom CA — passive observation gives you ~90% of the forensic value.
 - 🎯 **Curated blocklist templates** per device class (LG TV, Samsung TV, Echo Dot, iPhone, Android, ...) with **comments explaining every domain** (you decide what to block).
 - 🛡 **Consent enforcement** — refuses to enable monitoring for devices you don't own unless a `consent_doc:` is referenced. Family-friendly defaults.
 - 🔍 **Auto-discovery** — `nosey discover` scans the LAN, identifies devices by MAC vendor, suggests templates.

@@ -8,6 +8,12 @@
 gateway:
   ip: 192.168.0.210            # gateway host IP on your LAN
   dns: 192.168.0.204            # DNS server devices should use (your Pi-hole / AdGuard)
+  # `nosey capture` runs this command to pull Zeek logs from the gateway.
+  # {log} is substituted with each log filename (ssl.log, conn.log, quic.log, http.log).
+  # Direct SSH (most users):
+  zeek_fetch_cmd: "ssh root@192.168.0.210 'cat /opt/zeek/logs/current/{log}'"
+  # Or via Proxmox host with pct exec:
+  # zeek_fetch_cmd: "ssh root@pmx-50 'pct exec 110 -- cat /opt/zeek/logs/current/{log}'"
 
 # Path to the device registry (relative to this config file or absolute).
 registry: ./devices.yaml

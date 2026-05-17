@@ -4,6 +4,31 @@ All notable changes documented here. Format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-17
+
+### Added
+- **`nosey capture <device>`** — passive forensic mode (no MITM, no custom CA).
+  Pulls Zeek logs from the L3 gateway (via a configurable shell command),
+  filters on the device's IP, and emits a markdown report with:
+  - Summary: connection / TLS / QUIC / plaintext-HTTP counts, bytes up/down,
+    unique destinations and SNIs.
+  - Top 25 SNIs the device asked for.
+  - Top 15 destination IPs (with bytes, packets, ports, protocols, SNIs seen).
+  - TLS posture: versions, ciphers, key exchange curves
+    (flags `X25519MLKEM768` as iOS 18+ / macOS 15+ post-quantum hybrid).
+  - Cadence per minute (heartbeat detection) + connection duration percentiles.
+  - QUIC / HTTP/3 top SNIs.
+  - Plaintext HTTP requests (anything here = a leaky endpoint).
+- `gateway.zeek_fetch_cmd` config option — shell command template with `{log}`
+  placeholder. Works with direct SSH, `pct exec` (Proxmox), `kubectl exec`, etc.
+- `docs/playbooks/forensic-capture.md` would be a natural follow-up.
+
+### Notes
+- Capture mode is **complementary to MITM**: gives ~90% of forensic value
+  with zero device cooperation (no CA install, no certificate pinning issues).
+- Designed for the case "I want to see what the iPhone is *actually* doing
+  in the next 30 minutes without installing anything on the iPhone."
+
 ## [0.2.0] - 2026-05-17
 
 ### Added
