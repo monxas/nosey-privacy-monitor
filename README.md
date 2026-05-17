@@ -7,6 +7,13 @@
 Plug-and-play L3 traffic monitor + privacy auditor for your LAN. Catch the trackers,
 silence the telemetry, keep the streaming. Bring your own Pi-hole.
 
+</div>
+
+> 🪶 **Looking for just the curated blocklists?**
+> The templates here (LG TV, Samsung, Echo, iPhone, Roku) plus a tiny apply script live in a focused, lighter repo: **[`monxas/device-privacy-templates`](https://github.com/monxas/device-privacy-templates)**. No Zeek, no nftables — if you already have Pi-hole, you're done. Nosey (this repo) is the richer-but-heavier variant with the L3 transparent gateway, Zeek SNI inspection, and web UI.
+
+<div align="center">
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
