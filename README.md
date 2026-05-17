@@ -36,6 +36,7 @@ This repo is the tooling + the curated blocklists. Bring your own Pi-hole or AdG
 ## Features
 
 - 📋 **Device registry** as YAML — one file, one source of truth.
+- 🌐 **Web UI bridge** — `nosey serve` launches a local dashboard (FastAPI + HTMX) that pulls Pi-hole stats and **pushes template rules to Pi-hole groups with a diff/confirm flow**. No more copy-pasting blocklists into the Pi-hole admin.
 - 🎯 **Curated blocklist templates** per device class (LG TV, Samsung TV, Echo Dot, iPhone, Android, ...) with **comments explaining every domain** (you decide what to block).
 - 🛡 **Consent enforcement** — refuses to enable monitoring for devices you don't own unless a `consent_doc:` is referenced. Family-friendly defaults.
 - 🔍 **Auto-discovery** — `nosey discover` scans the LAN, identifies devices by MAC vendor, suggests templates.
@@ -68,6 +69,10 @@ bin/nosey apply
 
 # 6. Watch what your device is doing
 bin/nosey status my-device
+
+# 7. Optional — launch the web UI bridge to Pi-hole
+pip install "fastapi[standard]" uvicorn
+bin/nosey serve         # → http://127.0.0.1:8765
 ```
 
 That's it. No Kubernetes. No Docker. No cloud account. ~50 MB of Python + Zeek.
@@ -97,6 +102,47 @@ This is enough to identify ~95% of trackers and most telemetry endpoints. Read [
 You designate one host on your LAN as the "monitoring gateway" — a tiny machine (Proxmox LXC, Raspberry Pi, old laptop) running Linux with `nftables` + Zeek. Devices you opt in are configured (manually in iOS/macOS, or via WireGuard) to use that host as their **default gateway**. The gateway masquerades their traffic out to the internet, Zeek sniffs the flows in JSON, optional promtail ships logs to Loki/Grafana. DNS goes to your Pi-hole (or AdGuard), grouped per-device so each device gets its own blocklist policy. Devices you don't opt in are unaffected.
 
 Detailed diagrams: [docs/architecture.md](docs/architecture.md).
+
+---
+
+## The Pi-hole bridge (`nosey serve`)
+
+Run `nosey serve` and open `http://127.0.0.1:8765` — a local-only dashboard that:
+
+- **Pulls live Pi-hole stats** (queries/blocked/clients last 24h) via the Pi-hole 6 REST API.
+- **Lists every registered device** with its per-client query count + block %.
+- **Toggle enable/disable** per device — consent check enforced, just like the CLI.
+- **"Template diff" button** per device — shows exactly which domains the template would **add** / **remove** / **keep** in the Pi-hole group, with the `why_block` and `breaks_if_blocked` reason for each one. Confirm → it pushes those changes directly into Pi-hole via API.
+
+So you finally get answers to *"is my LG TV blocklist actually applied in Pi-hole right now?"* without clicking through 5 admin screens.
+
+The UI is a single Python file. Tailwind + HTMX from CDNs. No build step, no Node, no Docker. ~600 LOC total.
+
+```bash
+pip install "fastapi[standard]" uvicorn
+bin/nosey serve --host 127.0.0.1 --port 8765
+```
+
+> **Security**: by default `nosey serve` binds to localhost only. If you bind to `0.0.0.0`, put a reverse proxy with auth in front of it (Caddy + basicauth, Tailscale Funnel, etc.).
+
+---
+
+## How it compares to Pi-hole / AdGuard alone
+
+**Nosey is not a replacement for Pi-hole — it's a bridge that gives Pi-hole eyes and per-device curation.**
+
+|                                                                   | Pi-hole alone                | Nosey + Pi-hole                                  |
+| ----------------------------------------------------------------- | ---------------------------- | ------------------------------------------------ |
+| DNS blocking by domain                                            | ✅                            | ✅ (Pi-hole stays as the engine)                  |
+| Device hardcodes `8.8.8.8` → bypasses your blocker                | ❌ invisible                  | ✅ nft DNAT redirects to Pi-hole                  |
+| App uses DoH (`1.1.1.1:443`, `dns.google:443`)                    | ❌ invisible                  | ✅ DROPed at gateway, app falls back to OS DNS    |
+| TV connects to a cached IP (no DNS query)                         | ❌ never seen                 | ✅ nft IP DROP rules                              |
+| **What is each device *actually* doing right now?** (SNI per IP)  | ❌ only DNS, no post-resolve  | ✅ Zeek `ssl.log` shows real TLS hostnames        |
+| Per-device blocklist with `breaks_if_blocked` for every domain    | ⚠️ groups+adlists, no notes  | ✅ curated YAML templates with reasoning          |
+| Find brand-new trackers (Marfeel, Sensic, Adobe DTM)              | ❌ only if in a public adlist | ✅ from your own SSL logs in 1–2 hours of capture |
+| Apply a template (12 domains) to a device group                   | ❌ manual UI clicks           | ✅ one button + diff/confirm in `nosey serve`     |
+
+**One-liner**: Pi-hole tells you which queries it blocked. Nosey tells you what each device is doing when Pi-hole isn't looking.
 
 ---
 

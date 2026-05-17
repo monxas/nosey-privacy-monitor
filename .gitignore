@@ -5,6 +5,7 @@ config/devices.yaml
 
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 .venv/
 *.egg-info/

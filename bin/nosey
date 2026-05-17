@@ -11,6 +11,8 @@ Commands:
   status [name]           Health check: traffic seen, top SNIs, last-seen.
   discover                Scan LAN + suggest devices based on MAC vendor.
   wizard                  Interactive: scan → choose device → assign template → enable.
+  serve [--host --port]   Launch the web UI bridge (FastAPI + HTMX) — apply templates,
+                          push rules to Pi-hole, watch per-device stats.
 
 Config is loaded from $NOSEY_CONFIG or ./config/nosey.yaml.
 Device registry is in the path declared by `registry:` in the config.
@@ -247,6 +249,51 @@ class PiholeBackend(DNSBackend):
 
     def remove_group(self, group_id: int) -> None:
         self._call("DELETE", f"/api/groups/{group_id}")
+
+    # --- bridge extensions (used by `nosey serve` UI) ---
+
+    def stats_summary(self) -> dict:
+        s, d = self._call("GET", "/api/stats/summary")
+        return d or {}
+
+    def top_domains(self, n: int = 10, blocked: bool = False) -> list[dict]:
+        s, d = self._call("GET", f"/api/stats/top_domains?N={n}&blocked={'true' if blocked else 'false'}")
+        return (d or {}).get("domains", []) or (d or {}).get("top_domains", [])
+
+    def top_clients(self, n: int = 10, blocked: bool = False) -> list[dict]:
+        s, d = self._call("GET", f"/api/stats/top_clients?N={n}&blocked={'true' if blocked else 'false'}")
+        return (d or {}).get("clients", []) or (d or {}).get("top_sources", [])
+
+    def query_history(self, hours: int = 24) -> list[dict]:
+        s, d = self._call("GET", f"/api/history?N={hours}")
+        return (d or {}).get("history", [])
+
+    def list_domains(self, kind: Optional[str] = None) -> list[dict]:
+        """List all managed domains. kind=allow/exact, allow/regex, deny/exact, deny/regex, or None for all."""
+        path = "/api/domains" if not kind else f"/api/domains/{kind}"
+        s, d = self._call("GET", path)
+        return (d or {}).get("domains", [])
+
+    def add_domain(self, domain: str, *, deny: bool = True, regex: bool = False,
+                   groups: Optional[list[int]] = None, comment: str = "") -> bool:
+        typ = "deny" if deny else "allow"
+        kind = "regex" if regex else "exact"
+        body = {
+            "domain": domain,
+            "type": typ,
+            "kind": kind,
+            "comment": comment or "nosey",
+            "groups": groups or [0],
+            "enabled": True,
+        }
+        s, d = self._call("POST", f"/api/domains/{typ}/{kind}", body=body)
+        return s in (200, 201)
+
+    def remove_domain(self, domain: str, *, deny: bool = True, regex: bool = False) -> bool:
+        typ = "deny" if deny else "allow"
+        kind = "regex" if regex else "exact"
+        s, _ = self._call("DELETE", f"/api/domains/{typ}/{kind}/{urllib.parse.quote(domain, safe='')}")
+        return s in (200, 204)
 
 
 class AdguardBackend(DNSBackend):
@@ -582,6 +629,460 @@ def cmd_wizard(cfg: Config, args):
 
 
 # ---------------------------------------------------------------------------
+# Template diff (used by `nosey serve` UI bridge)
+# ---------------------------------------------------------------------------
+
+def template_entries(tpl: dict) -> list[dict]:
+    """Normalise template entries into a list of {domain, regex, tier, category, why_block, breaks_if_blocked}."""
+    out = []
+    for d in (tpl.get("domains") or []):
+        if "regex" in d:
+            out.append({
+                "value": d["regex"], "is_regex": True,
+                "tier": d.get("tier", tpl.get("default_tier", 2)),
+                "category": d.get("category", ""),
+                "why_block": d.get("why_block", ""),
+                "breaks_if_blocked": d.get("breaks_if_blocked", ""),
+            })
+        elif "domain" in d:
+            out.append({
+                "value": d["domain"], "is_regex": False,
+                "tier": d.get("tier", tpl.get("default_tier", 2)),
+                "category": d.get("category", ""),
+                "why_block": d.get("why_block", ""),
+                "breaks_if_blocked": d.get("breaks_if_blocked", ""),
+            })
+    return out
+
+
+def diff_template_vs_pihole(backend: "PiholeBackend", group_id: int, tpl_entries: list[dict]) -> dict:
+    """Compute add/remove/keep diff for a template against current Pi-hole state for a group."""
+    existing = backend.list_domains()
+    have_in_group = {
+        (d.get("domain"), d.get("kind") == "regex"): d
+        for d in existing
+        if group_id in (d.get("groups") or [])
+    }
+    template_keys = {(e["value"], e["is_regex"]): e for e in tpl_entries}
+
+    to_add = [e for key, e in template_keys.items() if key not in have_in_group]
+    to_keep = [e for key, e in template_keys.items() if key in have_in_group]
+    # Only flag nosey-managed leftovers for removal (avoid blowing away user's own entries)
+    to_remove = [
+        d for key, d in have_in_group.items()
+        if key not in template_keys and (d.get("comment") or "").startswith("nosey")
+    ]
+    return {"add": to_add, "remove": to_remove, "keep": to_keep}
+
+
+# ---------------------------------------------------------------------------
+# Web UI (nosey serve) — FastAPI + HTMX
+# ---------------------------------------------------------------------------
+
+WEB_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Nosey — privacy monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <style>
+    .tier-1 { background:#fef3c7; color:#92400e; }
+    .tier-2 { background:#fed7aa; color:#9a3412; }
+    .tier-3 { background:#fecaca; color:#991b1b; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+<header class="bg-white border-b border-slate-200 sticky top-0 z-10">
+  <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <span class="text-2xl">🔍</span>
+      <h1 class="text-xl font-bold">Nosey</h1>
+      <span class="text-xs text-slate-500 ml-2">privacy monitor</span>
+    </div>
+    <div id="status" hx-get="/htmx/status" hx-trigger="load, every 30s" class="text-sm"></div>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+  <section>
+    <h2 class="text-lg font-semibold mb-3">Pi-hole — last 24h</h2>
+    <div id="stats" hx-get="/htmx/stats" hx-trigger="load, every 30s"
+         class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+      <div class="bg-white p-4 rounded shadow-sm">Loading…</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-lg font-semibold">Devices</h2>
+      <span class="text-xs text-slate-500">Click a device for template management →</span>
+    </div>
+    <div id="devices" hx-get="/htmx/devices" hx-trigger="load, every 30s" class="space-y-3">
+      <div class="text-slate-400">Loading…</div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="text-lg font-semibold mb-3">Top blocked (24h)</h2>
+    <div id="top-blocked" hx-get="/htmx/top-blocked" hx-trigger="load, every 60s"
+         class="bg-white rounded shadow-sm divide-y divide-slate-100 text-sm"></div>
+  </section>
+
+</main>
+
+<div id="modal" class="hidden fixed inset-0 bg-black/40 z-20 items-center justify-center p-4"
+     onclick="if(event.target===this)this.classList.add('hidden')">
+  <div id="modal-content" class="bg-white rounded-lg shadow-xl max-w-3xl w-full max-h-[90vh] overflow-auto"></div>
+</div>
+
+<script>
+  document.body.addEventListener('htmx:afterRequest', e => {
+    if (e.detail.xhr.getResponseHeader('HX-Open-Modal')) {
+      document.getElementById('modal').classList.remove('hidden');
+      document.getElementById('modal').classList.add('flex');
+    }
+    if (e.detail.xhr.getResponseHeader('HX-Close-Modal')) {
+      document.getElementById('modal').classList.add('hidden');
+      document.getElementById('modal').classList.remove('flex');
+      htmx.trigger('#devices', 'load');
+      htmx.trigger('#stats', 'load');
+    }
+  });
+</script>
+</body>
+</html>"""
+
+
+def cmd_serve(cfg: Config, args):
+    try:
+        from fastapi import FastAPI, Request, Form
+        from fastapi.responses import HTMLResponse, Response
+        import uvicorn
+    except ImportError:
+        sys.stderr.write(
+            "ERR: fastapi + uvicorn required for `nosey serve`.\n"
+            "  Install: pip install 'fastapi[standard]' uvicorn\n"
+        )
+        return 2
+
+    app = FastAPI(title="Nosey", docs_url=None, redoc_url=None)
+
+    # cached backend (refresh login on auth failures)
+    _state: dict = {"backend": None, "last_login": 0.0}
+
+    def get_backend() -> Optional[PiholeBackend]:
+        now = time.time()
+        if _state["backend"] is None or (now - _state["last_login"]) > 300:
+            try:
+                b = make_backend(cfg)
+                if not isinstance(b, PiholeBackend):
+                    return None
+                b.login()
+                _state["backend"] = b
+                _state["last_login"] = now
+            except Exception as e:
+                sys.stderr.write(f"backend error: {e}\n")
+                return None
+        return _state["backend"]
+
+    def esc(s: Any) -> str:
+        import html as _h
+        return _h.escape(str(s) if s is not None else "")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index():
+        return WEB_HTML
+
+    @app.get("/htmx/status", response_class=HTMLResponse)
+    def htmx_status():
+        b = get_backend()
+        if b is None:
+            return '<span class="text-red-600">● Pi-hole: unreachable</span>'
+        return (f'<span class="text-emerald-600">● Pi-hole: '
+                f'<span class="font-mono">{esc(b.base)}</span></span>')
+
+    @app.get("/htmx/stats", response_class=HTMLResponse)
+    def htmx_stats():
+        b = get_backend()
+        if b is None:
+            return '<div class="col-span-4 text-red-600 bg-white p-4 rounded">Cannot reach Pi-hole API</div>'
+        try:
+            summary = b.stats_summary()
+        except Exception as e:
+            return f'<div class="col-span-4 text-red-600 bg-white p-4 rounded">{esc(e)}</div>'
+
+        q = summary.get("queries", {}) or summary
+        total = q.get("total") or q.get("dns_queries_today") or 0
+        blocked = q.get("blocked") or q.get("ads_blocked_today") or 0
+        pct = (blocked / total * 100) if total else 0.0
+        clients = q.get("active_clients") or q.get("unique_clients") or 0
+        upstreams = q.get("forwarded") or 0
+
+        cards = [
+            ("Queries", f"{total:,}", "text-slate-700"),
+            ("Blocked", f"{blocked:,}", "text-red-600"),
+            ("Block rate", f"{pct:.1f}%", "text-amber-600"),
+            ("Active clients", str(clients), "text-emerald-600"),
+        ]
+        html_ = ""
+        for label, val, cls in cards:
+            html_ += (f'<div class="bg-white p-4 rounded shadow-sm">'
+                      f'<div class="text-xs uppercase text-slate-400">{esc(label)}</div>'
+                      f'<div class="text-2xl font-semibold {cls}">{esc(val)}</div></div>')
+        return html_
+
+    @app.get("/htmx/top-blocked", response_class=HTMLResponse)
+    def htmx_top_blocked():
+        b = get_backend()
+        if b is None:
+            return '<div class="p-3 text-red-600">Pi-hole unreachable</div>'
+        rows = b.top_domains(n=12, blocked=True)
+        if not rows:
+            return '<div class="p-3 text-slate-400">No blocked queries yet.</div>'
+        out = ""
+        for r in rows:
+            dom = r.get("domain") or r.get("name") or "?"
+            n = r.get("count") or r.get("hits") or 0
+            out += (f'<div class="flex justify-between p-2 px-3">'
+                    f'<span class="font-mono text-xs truncate">{esc(dom)}</span>'
+                    f'<span class="text-slate-500 text-xs ml-2">{n:,}</span></div>')
+        return out
+
+    @app.get("/htmx/devices", response_class=HTMLResponse)
+    def htmx_devices():
+        devs = load_registry(cfg)
+        b = get_backend()
+        client_stats = {}
+        if b:
+            try:
+                for c in b.top_clients(n=50, blocked=False):
+                    ip = c.get("ip") or c.get("name") or ""
+                    client_stats.setdefault(ip, {})["total"] = c.get("count") or 0
+                for c in b.top_clients(n=50, blocked=True):
+                    ip = c.get("ip") or c.get("name") or ""
+                    client_stats.setdefault(ip, {})["blocked"] = c.get("count") or 0
+            except Exception:
+                pass
+
+        if not devs:
+            return ('<div class="bg-white rounded p-6 text-center text-slate-500">'
+                    'Registry empty. Run <code>nosey wizard</code> to add a device.</div>')
+        out = ""
+        for name, d in devs.items():
+            cs = client_stats.get(d.ip or "", {})
+            qtot = cs.get("total", 0)
+            qbl = cs.get("blocked", 0)
+            pct = (qbl / qtot * 100) if qtot else 0.0
+            badge = ('<span class="text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded text-xs">enabled</span>'
+                     if d.enabled else
+                     '<span class="text-slate-500 bg-slate-100 px-2 py-0.5 rounded text-xs">disabled</span>')
+            tpl_badge = (f'<span class="bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded text-xs font-mono">{esc(d.template)}</span>'
+                         if d.template else '<span class="text-slate-400 text-xs">no template</span>')
+            consent_warn = ""
+            if d.owner not in cfg.self_owners and not d.consent_doc:
+                consent_warn = '<span class="text-amber-700 bg-amber-100 px-2 py-0.5 rounded text-xs">⚠ no consent_doc</span>'
+            out += f"""
+<div class="bg-white rounded shadow-sm p-4">
+  <div class="flex items-start justify-between gap-4">
+    <div class="min-w-0">
+      <div class="flex items-center gap-2 flex-wrap">
+        <h3 class="font-semibold">{esc(name)}</h3>
+        {badge}
+        {tpl_badge}
+        {consent_warn}
+        <span class="text-xs text-slate-400">owner: {esc(d.owner)}</span>
+      </div>
+      <div class="text-xs text-slate-500 mt-1 font-mono">
+        {esc(d.ip or '?')} · {esc(d.mac or 'no mac')} · {esc(d.routing)}
+      </div>
+      <div class="text-xs text-slate-600 mt-2">
+        24h: <b>{qtot:,}</b> queries · <b class="text-red-600">{qbl:,}</b> blocked ({pct:.1f}%)
+      </div>
+    </div>
+    <div class="flex flex-col gap-1 shrink-0">
+      <button class="text-xs px-3 py-1 rounded bg-slate-700 text-white hover:bg-slate-900"
+              hx-post="/htmx/device/{esc(name)}/toggle" hx-target="#devices">
+        {'Disable' if d.enabled else 'Enable'}
+      </button>
+      <button class="text-xs px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-800
+              {'opacity-30 cursor-not-allowed' if not d.template else ''}"
+              {'disabled' if not d.template else ''}
+              hx-get="/htmx/device/{esc(name)}/diff" hx-target="#modal-content">
+        Template diff
+      </button>
+    </div>
+  </div>
+</div>"""
+        return out
+
+    @app.post("/htmx/device/{name}/toggle", response_class=HTMLResponse)
+    def htmx_toggle(name: str):
+        devs = load_registry(cfg)
+        if name not in devs:
+            return Response(status_code=404)
+        d = devs[name]
+        if not d.enabled and d.owner not in cfg.self_owners and not d.consent_doc:
+            return ('<div class="bg-amber-50 border border-amber-300 p-3 rounded text-amber-900">'
+                    f'⛔ <b>{esc(name)}</b> requires <code>consent_doc</code> before enabling. '
+                    'See <code>CONTRIBUTING.md → consent</code>.</div>')
+        d.enabled = not d.enabled
+        save_registry(cfg, devs)
+        return htmx_devices()
+
+    @app.get("/htmx/device/{name}/diff", response_class=HTMLResponse)
+    def htmx_diff(name: str):
+        devs = load_registry(cfg)
+        if name not in devs or not devs[name].template:
+            return Response(status_code=404)
+        d = devs[name]
+        b = get_backend()
+        if b is None:
+            return '<div class="p-6 text-red-600">Pi-hole unreachable</div>'
+
+        gid = d.dns_group_id
+        if gid is None:
+            try:
+                gid = b.ensure_group(d.dns_group or name, comment=f"nosey: {name}")
+                d.dns_group_id = gid
+                save_registry(cfg, devs)
+            except Exception as e:
+                return f'<div class="p-6 text-red-600">Could not ensure group: {esc(e)}</div>'
+
+        tpl = load_template(cfg, d.template)
+        entries = template_entries(tpl)
+        try:
+            diff = diff_template_vs_pihole(b, gid, entries)
+        except Exception as e:
+            return f'<div class="p-6 text-red-600">Diff failed: {esc(e)}</div>'
+
+        def row_add(e):
+            kind = "regex" if e["is_regex"] else "exact"
+            return (f'<tr class="border-t border-slate-100">'
+                    f'<td class="p-2 text-green-700">+</td>'
+                    f'<td class="p-2"><span class="tier-{e["tier"]} px-1.5 rounded text-xs">T{e["tier"]}</span></td>'
+                    f'<td class="p-2 font-mono text-xs">{esc(e["value"])}</td>'
+                    f'<td class="p-2 text-xs text-slate-500">{esc(kind)}</td>'
+                    f'<td class="p-2 text-xs">{esc(e.get("why_block",""))}<br>'
+                    f'<span class="text-slate-400">breaks: {esc(e.get("breaks_if_blocked","-"))}</span></td>'
+                    f'</tr>')
+
+        def row_remove(r):
+            return (f'<tr class="border-t border-slate-100">'
+                    f'<td class="p-2 text-red-700">−</td><td></td>'
+                    f'<td class="p-2 font-mono text-xs">{esc(r.get("domain"))}</td>'
+                    f'<td class="p-2 text-xs text-slate-500">{esc(r.get("kind",""))}</td>'
+                    f'<td class="p-2 text-xs text-slate-500">currently in group (nosey-managed)</td>'
+                    f'</tr>')
+
+        adds_html = "".join(row_add(e) for e in diff["add"]) or '<tr><td colspan="5" class="p-3 text-slate-400 text-center">Nothing new to add — group is up to date.</td></tr>'
+        rems_html = "".join(row_remove(r) for r in diff["remove"]) or ""
+        rem_section = ""
+        if rems_html:
+            rem_section = (
+                '<h4 class="font-semibold mt-4 mb-1 text-red-700">To remove '
+                f'({len(diff["remove"])})</h4>'
+                '<table class="w-full text-sm"><tbody>' + rems_html + '</tbody></table>'
+            )
+        return f"""
+<div class="p-6">
+  <div class="flex items-center justify-between mb-4">
+    <h2 class="text-lg font-bold">Apply <code>{esc(d.template)}</code> → <code>{esc(name)}</code></h2>
+    <button onclick="document.getElementById('modal').classList.add('hidden')"
+            class="text-slate-400 hover:text-slate-700">✕</button>
+  </div>
+  <div class="text-sm text-slate-600 mb-3">
+    Group: <code>{esc(d.dns_group or name)}</code> (id={gid}) · device: <code>{esc(d.ip or '?')}</code>
+  </div>
+  <div class="flex gap-4 text-sm mb-3">
+    <span class="text-green-700">+ {len(diff["add"])} to add</span>
+    <span class="text-red-700">− {len(diff["remove"])} to remove</span>
+    <span class="text-slate-500">= {len(diff["keep"])} already in group</span>
+  </div>
+  <h4 class="font-semibold mb-1 text-green-700">To add ({len(diff["add"])})</h4>
+  <table class="w-full text-sm">
+    <thead><tr class="text-xs text-slate-500 text-left"><th></th><th>Tier</th><th>Domain</th><th>Kind</th><th>Reason</th></tr></thead>
+    <tbody>{adds_html}</tbody>
+  </table>
+  {rem_section}
+  <div class="mt-6 flex justify-end gap-2">
+    <button onclick="document.getElementById('modal').classList.add('hidden')"
+            class="px-4 py-2 rounded bg-slate-200 hover:bg-slate-300 text-sm">Cancel</button>
+    <button hx-post="/htmx/device/{esc(name)}/apply"
+            hx-target="#modal-content" hx-swap="innerHTML"
+            class="px-4 py-2 rounded bg-indigo-600 text-white hover:bg-indigo-800 text-sm">
+      Confirm — push {len(diff["add"])+len(diff["remove"])} change(s) to Pi-hole
+    </button>
+  </div>
+</div>"""
+
+    @app.post("/htmx/device/{name}/apply", response_class=HTMLResponse)
+    def htmx_apply(name: str):
+        devs = load_registry(cfg)
+        if name not in devs or not devs[name].template:
+            return Response(status_code=404)
+        d = devs[name]
+        b = get_backend()
+        if b is None:
+            return '<div class="p-6 text-red-600">Pi-hole unreachable</div>'
+
+        gid = d.dns_group_id or b.ensure_group(d.dns_group or name, comment=f"nosey: {name}")
+        d.dns_group_id = gid
+        if d.ip:
+            try:
+                b.ensure_client(d.ip, gid, comment=f"nosey: {name}")
+            except Exception:
+                pass
+
+        tpl = load_template(cfg, d.template)
+        entries = template_entries(tpl)
+        diff = diff_template_vs_pihole(b, gid, entries)
+
+        added = 0
+        failed_add = 0
+        for e in diff["add"]:
+            ok = b.add_domain(e["value"], deny=True, regex=e["is_regex"],
+                              groups=[gid], comment=f"nosey:{d.template}")
+            if ok: added += 1
+            else: failed_add += 1
+        removed = 0
+        for r in diff["remove"]:
+            ok = b.remove_domain(r["domain"], deny=True, regex=(r.get("kind") == "regex"))
+            if ok: removed += 1
+
+        save_registry(cfg, devs)
+        resp = Response(
+            content=f"""
+<div class="p-6">
+  <h2 class="text-lg font-bold mb-3 text-emerald-700">✓ Applied</h2>
+  <ul class="text-sm space-y-1 text-slate-700">
+    <li>Group: <code>{esc(d.dns_group)}</code> (id={gid})</li>
+    <li>Client <code>{esc(d.ip or '?')}</code> attached</li>
+    <li><b class="text-green-700">{added}</b> domain(s) added{f' · <b class="text-red-700">{failed_add}</b> failed' if failed_add else ''}</li>
+    <li><b class="text-red-700">{removed}</b> domain(s) removed</li>
+  </ul>
+  <div class="mt-4 text-right">
+    <button onclick="document.getElementById('modal').classList.add('hidden')"
+            class="px-4 py-2 rounded bg-slate-200 hover:bg-slate-300 text-sm">Close</button>
+  </div>
+</div>""",
+            media_type="text/html",
+        )
+        resp.headers["HX-Close-Modal"] = "1"
+        return resp
+
+    print(f"nosey serve — http://{args.host}:{args.port}")
+    print(f"  pi-hole api: {cfg.dns_backend.get('api_url', '(unset)')}")
+    print(f"  registry:    {cfg.registry_path}")
+    print(f"  Open the URL above in your browser. Ctrl+C to stop.\n")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -625,6 +1126,11 @@ def main():
     w = sub.add_parser("wizard", help="interactive add")
     w.add_argument("--subnet", default="192.168.0.0/24")
     w.set_defaults(func=cmd_wizard)
+
+    sv = sub.add_parser("serve", help="web UI bridge (FastAPI + HTMX)")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8765)
+    sv.set_defaults(func=cmd_serve)
 
     args = p.parse_args()
     sys.exit(args.func(cfg, args) or 0)

@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pyyaml
+      - run: pip install pyyaml 'fastapi[standard]' uvicorn
       - name: nosey --help
         run: |
           export NOSEY_CONFIG=config/nosey.example.yaml
@@ -23,3 +23,6 @@ jobs:
         run: |
           export NOSEY_CONFIG=config/nosey.example.yaml
           bin/nosey list
+      - name: import nosey serve handlers (syntax + import test)
+        run: |
+          python -c "import importlib.util, sys; spec=importlib.util.spec_from_file_location('nosey','bin/nosey'); m=importlib.util.module_from_spec(spec); sys.modules['nosey']=m; spec.loader.exec_module(m); assert callable(m.cmd_serve)"
