@@ -1,16 +1,20 @@
 <div align="center">
 
-# 🔍 Nosey
+# 🔍 Nosey  *(archived)*
 
 **Find out what your smart devices are really talking to.**
 
-Plug-and-play L3 traffic monitor + privacy auditor for your LAN. Catch the trackers,
-silence the telemetry, keep the streaming. Bring your own Pi-hole.
+Plug-and-play L3 traffic monitor + privacy auditor for your LAN.
 
 </div>
 
-> 🪶 **Looking for just the curated blocklists?**
-> The templates here (LG TV, Samsung, Echo, iPhone, Roku) plus a tiny apply script live in a focused, lighter repo: **[`monxas/device-privacy-templates`](https://github.com/monxas/device-privacy-templates)**. No Zeek, no nftables — if you already have Pi-hole, you're done. Nosey (this repo) is the richer-but-heavier variant with the L3 transparent gateway, Zeek SNI inspection, and web UI.
+> ## 📦 Archived
+>
+> This repo is **archived**. It works, but the author measured empirically that **a well-configured Pi-hole with mainstream gravity adlists (Steven Black, AdGuard DNS, EasyPrivacy, firstparty-trackers, …) already blocks ~64% of what these templates would push, and the residual is mostly Tier 2/3 manufacturer-specific endpoints that break legit features**. The unique value of the project was the structured YAML schema (`breaks_if_blocked:` notes per domain), not the blocking itself.
+>
+> Left here as a portfolio reference and for anyone who wants to fork the L3 gateway + Zeek capture mode. PRs are no longer reviewed.
+>
+> For a focused subset of just the schema + templates + apply script, see the (also archived) sibling repo [`device-privacy-templates`](https://github.com/monxas/device-privacy-templates).
 
 <div align="center">
 
